@@ -1,0 +1,1998 @@
+---
+title: "Host and pathogen gene expression associated with clinical parameters"
+output: html_notebook
+---
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Section 1: Host gene expression associated with parasitemia and estimation of the contribution of all variables to variance in human gene expression
+Figures: 1A, 2, Supplemental 1
+Tables: 2, Supplemental 2, Supplemental 3
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Human
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+projects <- read.delim("percent_duplicate_human_edited.txt")
+sample_list <- projects[str_detect(projects$Project, "symptomatic"), ]
+sample_list$Sample <- paste("X", sample_list$Sample, sep="")
+sample_list$Sample <- paste0(sample_list$Sample, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$Sample)
+
+counts <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts[] <- sapply(counts, as.numeric)
+
+all <- read.csv("mali_samples_allvariables.csv")
+all <- all[str_detect(all$project, "symptomatic"),]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts)){
+  colnames(counts)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts)[col])
+}
+
+for ( col in 1:ncol(counts)){
+  colnames(counts)[col] <-  sub("*X", "", colnames(counts)[col])
+}
+
+counts <- counts[,colnames(counts) %in% all$id]
+rownames(counts) <- human_counts_all.txt$Geneid
+
+all <- all[all$id %in% colnames(counts),]
+all <- all[ order(match(all$id, colnames(counts))), ]
+
+##Supplemental figure 1
+summary(lm(parasitemiepf ~ AlignedPlasmodium, data = all))
+ggplot(all, aes(x = AlignedPlasmodium, y = parasitemiepf)) + 
+  geom_point() + 
+  theme_classic() + 
+  geom_smooth(method = "lm", se = FALSE, color = "red") +
+  annotate("text", x = 12000000, y = 6e+05, label = "R-sqr = 0.36, p = 1.02e-14", size = 5) + 
+  labs(y = expression(paste(italic("P. falciparum "), "parasitemia")), x = expression(paste("Reads aligned to ", italic("P. falciparum")))) + 
+  theme(text = element_text(size = 20))
+
+dgList <- DGEList(counts=counts, genes=human_counts_all.txt[c(1)])
+
+keep <- rowSums(cpm(dgList)>10) >= (ncol(dgList$counts)/2)
+table(keep)
+dgList_strictfilter <- dgList[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_strictfilter))
+dim(dgList_strictfilter)
+
+dgList_strictfilter <- calcNormFactors(dgList_strictfilter, method="TMM")
+
+#Variance partition
+gene_count <- cpm(dgList_strictfilter$counts)
+
+##Add in other variables for variance partition
+coi <- read.delim("coi_v1.txt", header = TRUE)
+coi <- coi[ order(match(coi$Sample, colnames(counts))), ]
+
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infections <- infections[ order(match(infections$id, colnames(counts))), ]
+
+###Read in gene metadata for each sample
+all$Age <- (all$year.x + 2000) - all$yearob
+all$Parasitemia <- log(all$parasitemiepf)
+all$Sex <- ifelse(all$gender == 1, "M", "F")
+all$Ethnicity <- all$ethnicity
+all$SubsequentInfections <- infections$infections_per_persontime
+all$TimeToInfections <- infections$time_to_next_sympto_infection
+all$COI <- coi$fws_call
+
+###Define formula
+form <- ~ Age + Parasitemia + (1| Sex) + SubsequentInfections + TimeToInfections + (1| COI) 
+
+###Create model
+varPart <- fitExtractVarPartModel(gene_count, form, all)
+
+###Sort variables by median fraction of variance explained
+vp <- sortCols( varPart )
+plotVarPart(vp)
+
+##Identify correlated variables
+#parasitemia vs. age
+summary(lm(log(parasitemiepf) ~ age, data = all))
+
+all$age <- (all$year.x + 2000) - all$yearob
+ggplot(all, aes(x = age, y = log(parasitemiepf))) + 
+  geom_point() + 
+  theme_minimal() + 
+  xlab("Participant Age") + ylab("Log Parasitemia") + 
+  geom_smooth(method = "lm", se = FALSE, col = "red") + 
+  theme(text = element_text(size = 20)) + 
+  annotate("text", x = 10, y = 15, label = "R-sqr = 0.031, p = 0.023", size = 10)
+
+#parasitemia vs. ethnicity
+df <- all
+df$ethnicity <- ifelse(df$ethnicity == "Dogon", "Dogon", "Other")
+
+ggplot(df, aes(x = ethnicity, y = log(parasitemiepf))) +
+  geom_violin(trim = FALSE, aes(fill = ethnicity)) + 
+  geom_jitter(height = 0, width = 0.1) + 
+  theme_minimal() + theme(text = element_text(size = 20), legend.position = "none") + 
+  xlab("Participant Ethnicity") + ylab("Log Parasitemia") +
+  stat_compare_means(method = "t.test", label.x = 1.2, label.y = 16, size = 10) 
+
+##DIFFERENTIAL EXPRESSION ACCORDING TO PARASITEMIA
+all <- all[ order(match(all$id, colnames(dgList_strictfilter))), ]
+parasitemia <- as.numeric(log(all$parasitemiepf))
+
+dgList_strictfilter$samples$group <- parasitemia
+hist(dgList_strictfilter$samples$group, main = NULL, xlab = "Log Parasitemia", ylab = "Number of Individuals")
+
+age <- (all$year.x + 2000) - all$yearob
+sex <- factor(all$gender)
+month <- factor(all$month.x)
+
+design_parasitemia <- model.matrix(~dgList_strictfilter$samples$group + age + sex + month)
+rownames(design_parasitemia) <- colnames(dgList_strictfilter)
+design_parasitemia
+
+immune_cells <- read.csv("human_symptomatic_deconvresults.csv")
+immune_cells <- immune_cells[ order(match(immune_cells$Mixture, colnames(dgList_strictfilter$counts))), ]
+
+age <- (all$year.x + 2000) - all$yearob
+sex <- as.factor(all$gender)
+month <- as.factor(all$month.x)
+B <- immune_cells$B
+pc <- immune_cells$Plasma.cells
+t <- immune_cells$T
+nk <- immune_cells$NK
+mono <- immune_cells$Monocytes
+neut <- immune_cells$Neutrophils
+
+design_parasitemia_adj <- model.matrix(~dgList_strictfilter$samples$group+age+sex+month+B+pc+t+nk+mono+neut)
+rownames(design_parasitemia_adj) <- colnames(dgList_strictfilter)
+design_parasitemia_adj
+
+##Estimate dispersion 
+y <- estimateDisp(dgList_strictfilter)
+
+fit <- glmFit(y, design_parasitemia_adj)
+lrt <- glmLRT(fit, coef = 2)
+topTags(lrt)
+summary(decideTests(lrt))
+
+resultsp <- as.data.frame(lrt$table)
+resultsp$FDR <- p.adjust(resultsp$PValue, method="fdr")
+
+results_up <- subset(resultsp, logFC > 0)
+results_up <- subset(results_up, FDR < 0.1)
+results_up$logpval <- -log10(results_up$PValue)
+
+results_down <- subset(resultsp, logFC < 0)
+results_down <- subset(results_down, FDR < 0.1)
+results_down$logpval <- -log10(results_down$PValue)
+
+resultsp$deexpressed <- ifelse(resultsp$FDR <= 0.1 & resultsp$logFC >= 0, "UP", 
+                               ifelse(resultsp$FDR <= 0.1 & resultsp$logFC < 0, "DOWN", "NO"))
+resultsp$gene <- rownames(resultsp)
+
+mygenes <- c("MMP8", "SMIM1", "CD177", "ITGAM", "ICAM1", "MMP9", "ARG1", "ARG1", "CXCR1", "CCRL2", "CD3", "CD4", "CD8", "TRBC1", "TRBC2", "ZAP70", "LCK", "GATA3", "BCL11B", "TCF7", "CXCR3", "CXCR5", "GZMM", "GZMA", "GZMK")
+
+mygenes_adj <- c("MMP8", "SMIM1")
+
+mycolors <- c("blue", "red", "black")
+
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(resultsp) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = resultsp %>% 
+                  filter(rownames(resultsp) %in% mygenes_adj), 
+                  aes(label = gene, x = logFC, y = -log10(PValue)), size = 5, max.overlaps = 30) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+```
+
+Section 2: Parasite gene expression associated with parasitemia and estimation of the contribution of each variable to the overall variance in parasite gene expression
+Figures: 1B, 3
+Tables: 2, Supplemental 2, Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Plasmodium 
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts)){
+  colnames(counts)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts)[col])
+}
+
+for ( col in 1:ncol(counts)){
+  colnames(counts)[col] <-  sub("*X", "", colnames(counts)[col])
+}
+
+##Subset by project
+projects <- read.delim("percent_duplicate_human_edited.txt")
+sample_list <- projects[str_detect(projects$Project, "symptomatic"), ]
+sample_list <- as.list(sample_list$Sample)
+
+all <- read.csv("mali_samples_allvariables.csv")
+all <- all[str_detect(all$project, "symptomatic"),]
+
+counts <- counts[,colnames(counts) %in% sample_list] 
+all <- all[all$id %in% colnames(counts),]
+rownames(counts) <- pf_counts_all.txt$Geneid
+
+all <- all[order(match(all$id, colnames(counts))),]
+
+##Make dgList and filter by expression and normalize
+dgList_pf <- DGEList(counts=counts, genes=pf_counts_all.txt[c(1)])
+
+keep <- rowSums(cpm(dgList_pf)>10) >= (ncol(dgList_pf$counts)/2)
+table(keep)
+dgList_pf_filtered <- dgList_pf[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_pf_filtered))
+dim(dgList_pf_filtered)
+
+dgList_pf_filtered <- calcNormFactors(dgList_pf_filtered, method="TMM")
+
+gene_count <- cpm(dgList_pf_filtered$counts)
+
+##Add in other variables for variance partition
+coi <- read.delim("coi_v1.txt", header = TRUE)
+coi <- coi[ order(match(coi$Sample, colnames(counts))), ]
+
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infections <- infections[ order(match(infections$id, colnames(counts))), ]
+
+###Read in gene metadata for each sample
+all$Age <- as.numeric((all$year.x + 2000) - all$yearob)
+all$Parasitemia <- log(all$parasitemiepf)
+all$Sex <- ifelse(all$gender == 1, "M", "F")
+all$Ethnicity <- all$ethnicity
+all$SubsequentInfections <- infections$infections_per_persontime
+all$TimeToInfections <- infections$time_to_next_sympto_infection
+all$COI <- coi$fws_call
+
+###Define formula
+form <- ~ Age + Parasitemia + (1| Sex) + SubsequentInfections + TimeToInfections + (1| COI) 
+
+###Create model
+varPart <- fitExtractVarPartModel(gene_count, form, all)
+
+###Sort variables by median fraction of variance explained
+vp <- sortCols( varPart )
+plotVarPart(vp)
+
+##DIFFERENTIAL EXPRESSION BY PARASITEMIA
+dgList_pf_filtered$samples$group <- log(all$parasitemiepf)
+
+age <- (all$year.x + 2000) - all$yearob
+month <- factor(all$month.x)
+sex <- factor(all$gender)
+
+stages <- read.csv("pf_symptomatic_deconv.csv")
+names(stages)[names(stages) == 'Mixture'] <- 'id'
+stages <- stages[stages$id %in% all$id,]
+stages <- stages[ order(match(stages$id, all$id)), ]
+ring <- stages$ring
+troph <- stages$troph
+schiz <- stages$schiz
+M <- stages$M
+F <- stages$F
+
+design <- model.matrix(~dgList_pf_filtered$samples$group + age + month + sex)
+rownames(design) <- rownames(dgList_pf$samples)
+design
+
+design_adj <- model.matrix(~dgList_pf_filtered$samples$group+ring+troph+schiz+M+ age + month + sex)
+rownames(design_adj) <- rownames(dgList_pf_filtered$samples)
+design_adj
+
+#Estimate dispersion
+y <- estimateDisp(dgList_pf_filtered)
+
+##Run linear models with LRT 
+fit <- glmFit(y, design_adj)
+lrt <- glmLRT(fit, coef = 2)
+final_glm <- decideTests(lrt)
+summary(final_glm)
+
+results <- as.data.frame(lrt$table)
+results$FDR <- p.adjust(results$PValue, method="fdr")
+
+
+results_up <- subset(results, logFC > 0)
+results_up <- subset(results_up, FDR < 0.1)
+results_up$logpval <- -log10(results_up$PValue)
+
+results_down <- subset(results, logFC < 0)
+results_down <- subset(results_down, FDR < 0.1)
+results_down$logpval <- -log10(results_down$PValue)
+
+##Volcano plot
+results$deexpressed <- ifelse(results$FDR <= 0.1 & results$logFC >= 0, "UP", 
+                              ifelse(results$FDR <= 0.1 & results$logFC < 0, "DOWN", "NO"))
+
+mygenes <- c("PF3D7_0831800", "PF3D7_1130000", "PF3D7_1230700", "PF3D7_1246200", "PF3D7_1103800", "PF3D7_0517400", 
+             "PF3D7_0217500", "PF3D7_1229300", "PF3D7_0628100", "PF3D7_0102600", "PF3D7_0726200", "PF3D7_0501300", "PF3D7_0406200",
+             "PF3D7_1438400")
+
+names(mygenes) <- c("PfHRP2", "PfPAGM", "PfSEC13", "PfACT1", "PfNOT-G1", "PfFACT-L", "PfCDPK1", "PfPIC1", "PfHECT1", "PfFIKK1",
+                    "PfFIKK7.1", "PfSBP1", "PfPfs16", "PfMCA2")
+
+mycolors <- c("blue", "red", "black")
+
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+results$gene <- rownames(results)
+results$genename <- ifelse(results$gene == "PF3D7_0831800", "PfHRP2", 
+                           ifelse(results$gene ==  "PF3D7_1130000", "PfPAGM",
+                                  ifelse(results$gene == "PF3D7_1230700", "PfSEC13",
+                                                ifelse(results$gene == "PF3D7_1246200", "PfACT1",
+                                                       ifelse(results$gene == "PF3D7_1103800", "PfNOT-G1",
+                                                              ifelse(results$gene == "PF3D7_0517400", "PfFACT-L",
+                                                                     ifelse(results$gene == "PF3D7_0217500", "PfCDPK1", 
+                                                                            ifelse(results$gene == "PF3D7_1229300", "PfPIC1", 
+                                                                                   ifelse(results$gene == "PF3D7_0628100", "PfHECT1",
+                                                                                          ifelse(results$gene == "PF3D7_0102600", "PfFIKK1",
+                                                                                                 ifelse(results$gene == "PF3D7_0726200", "PfFIKK7.1",
+                                                                                                        ifelse(results$gene == "PF3D7_0501300", "PfSBP1",
+                                                                                                               ifelse(results$gene == "PF3D7_0406200", "PfPfs16",
+                                                                                                                      ifelse(results$gene == "PF3D7_1438400", "PfMCA2", "NA"))))))))))))))
+
+
+ggplot(results) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results %>% 
+                    filter(rownames(results) %in% mygenes), 
+                  aes(label = genename, x = logFC, y = -log10(PValue)),size = 5) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+##ggplot unlabeled genes
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+```
+
+Section 3: Host gene expression associated with participant's age
+Figures: 4, Supplemental 3
+Tables: Supplemental 3
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+sample_list <- read.delim("subsequent_infections_edit.txt", header = T)
+sample_list$name <- paste("X", sample_list$id, sep="")
+sample_list$name <- paste0(sample_list$name, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$name)
+
+counts_age <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts_age[] <- sapply(counts_age, as.numeric)
+rownames(counts_age) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_age)[col])
+}
+
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub("*X", "", colnames(counts_age)[col])
+}
+
+##Create DGList
+dgList_age_human <- DGEList(counts=counts_age, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_age_human)>10) >= (ncol(dgList_age_human$counts)/2)
+table(keep)
+dgList_human_age_filter <- dgList_age_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_age_filter))
+dim(dgList_human_age_filter)
+
+##Normalize
+dgList_human_age_filter <- calcNormFactors(dgList_human_age_filter, method="TMM")
+
+##Correlate sex with gene expression
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age <- all_age[all_age$id %in% colnames(counts_age),]
+all_age <- all_age[ order(match(all_age$id, colnames(counts_age))), ]
+
+all_age$age <- as.numeric((all_age$year.x + 2000) - all_age$yearob)
+#age <- as.numeric((all_age$year.x + 2000) - all_age$yearob)
+
+dgList_human_age_filter$samples$group <- age
+
+parasitemia <- as.numeric(log(all_age$parasitemiepf))
+sex <- factor(all_age$gender)
+month <- factor(all_age$month.x)
+
+##Unadjusted model for immune cell composition
+design_age <- model.matrix(~dgList_human_age_filter$samples$group + parasitemia + sex + month)
+rownames(design_age) <- colnames(dgList_human_age_filter)
+design_age
+
+immune_cells <- read.csv("human_symptomatic_deconvresults.csv")
+immune_cells <- immune_cells[ order(match(immune_cells$Mixture, colnames(dgList_human_age_filter$counts))), ]
+
+age <- (all_age$year.x + 2000) - all_age$yearob
+sex <- as.factor(all_age$gender)
+B <- immune_cells$B
+pc <- immune_cells$Plasma.cells
+t <- immune_cells$T
+nk <- immune_cells$NK
+mono <- immune_cells$Monocytes
+neut <- immune_cells$Neutrophils
+
+design_age_adj <- model.matrix(~dgList_human_age_filter$samples$group + parasitemia + month + sex + B + pc + t + nk + mono + neut)
+rownames(design_age_adj) <- colnames(dgList_human_age_filter)
+design_age_adj
+
+##Estimate dispersion 
+y_age <- estimateDisp(dgList_human_age_filter)
+
+fit_age <- glmFit(y_age, design_age_adj)
+lrt_age <- glmLRT(fit_age, coef = 2)
+topTags(lrt_age)
+#summary(decideTests(lrt_age))
+
+results_age <- as.data.frame(lrt_age$table)
+results_age$FDR <- p.adjust(results_age$PValue, method="fdr")
+
+results_up_age <- subset(results_age, logFC > 0)
+results_up_age <- subset(results_up_age, FDR < 0.1)
+results_up_age$logpval <- -log10(results_up_age$PValue)
+
+results_down_age <- subset(results_age, logFC < 0)
+results_down_age <- subset(results_down_age, FDR < 0.1)
+results_down_age$logpval <- -log10(results_down_age$PValue)
+
+results_age$deexpressed <- ifelse(results_age$FDR <= 0.1 & results_age$logFC >= 0, "UP", 
+                                  ifelse(results_age$FDR <= 0.1 & results_age$logFC < 0, "DOWN", "NO"))
+
+
+##Label ggplot with genes 
+results_age$gene <- rownames(results_age)
+
+mygenes <- c("PLCB2", "Pi3K", "ABAT", "MEF2D", "RASAL3", "LSP1", "CAPN1", "CAPNS1", "CDC25B", "CDK9", "COL18A1", "HCLS1", "MNT", "RGS1", "IDO1", "CXCL10")
+
+mycolors <- c("blue", "red", "black")
+
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_age) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_age %>% 
+                    filter(rownames(results_age) %in% mygenes), 
+                  aes(label = gene, x = logFC, y = -log10(PValue)), size = 5) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+#Scatter plots of which immune cell subsets are associated with age specifically 
+
+df <- data.frame(cbind(immune_cells, all_age))
+summary(lm(Plasma.cells ~ age, data = df))
+
+ggplot(df, aes(x = Neutrophils, y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Proportion of Neutrophils") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 0.3, y = 16, label = "Rsqr = 0.07, p = 0.0019", size = 8)
+
+ggplot(df, aes(x = B, y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Proportion of B Cells") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 0.08, y = 16, label = "Rsqr = 0.13, p = 2.098e-05", size = 8)
+
+ggplot(df, aes(x = NK, y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Proportion of NK Cells") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 0.08, y = 16, label = "Rsqr = 0.13, p = 1.146e-05", size = 8)
+
+ggplot(df, aes(x = Plasma.cells, y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Proportion of Plasma Cells") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 0.03, y = 16, label = "Rsqr = 0.06, p = 0.004", size = 8)
+
+ggplot(df, aes(x = log(parasitemiepf), y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Log Parasitemia") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 8, y = 16, label = "Rsqr = 0.04, p = 0.002", size = 8)
+
+```
+
+Section 4: Parasite gene expression associated with participant age
+Figures: 5
+Tables: Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Pf
+#Read in count table
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_age <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_age)[col])
+}
+
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub("*X", "", colnames(counts_pf_age)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infection_list_age <- as.list(infections$id)
+
+counts_pf_age <- counts_pf_age[,colnames(counts_pf_age) %in% infection_list_age]
+counts_pf_age[] <- sapply(counts_pf_age, as.numeric)
+rownames(counts_pf_age) <- pf_counts_all.txt$Geneid
+
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age <- all_age[all_age$id %in% colnames(counts_pf_age),]
+all_age <- all_age[ order(match(all_age$id, colnames(counts_pf_age))), ]
+
+##Create DGList
+dgList_pf_age <- DGEList(counts=counts_pf_age, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_age)>10) >= (ncol(dgList_pf_age$counts)/2)
+table(keep)
+dgListfilter_pf_age <- dgList_pf_age[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_age))
+dim(dgListfilter_pf_age)
+
+##Normalize
+dgListfilter_pf_age <- calcNormFactors(dgListfilter_pf_age, method="TMM")
+
+all_age$age <- (all_age$year.x + 2000) - all_age$yearob
+age <- (all_age$year.x + 2000) - all_age$yearob
+month <- factor(all_age$month.x)
+dgListfilter_pf_age$samples$group <- as.numeric(age)
+
+parasitemia <- as.numeric(log(all_age$parasitemiepf))
+sex <- factor(all_age$gender)
+month <- factor(all_age$month.x)
+
+##Unadjusted model for immune cell composition
+design_pf_age <- model.matrix(~dgListfilter_pf_age$samples$group + parasitemia + sex + month)
+rownames(design_pf_age) <- colnames(dgListfilter_pf_age)
+design_pf_age
+
+stages <- read.csv("pf_symptomatic_deconv.csv")
+names(stages)[names(stages) == 'Mixture'] <- 'id'
+stages <- stages[stages$id %in% all_age$id,]
+stages <- stages[ order(match(stages$id, all_age$id)), ]
+ring <- stages$ring
+troph <- stages$troph
+schiz <- stages$schiz
+M <- stages$M
+
+design_pf_age_adj <- model.matrix(~dgListfilter_pf_age$samples$group + parasitemia + sex + month + ring + troph + schiz + M)
+rownames(design_pf_age_adj) <- colnames(dgListfilter_pf_age)
+design_pf_age_adj
+
+##Estimate dispersion
+y_pf_age <- estimateDisp(dgListfilter_pf_age)
+
+fit_pf_age <- glmFit(y_pf_age, design_pf_age_adj)
+lrt_pf_age <- glmLRT(fit_pf_age, coef = 2)
+topTags(lrt_pf_age)
+summary(decideTests(lrt_pf_age))
+
+results_pf_age <- as.data.frame(lrt_pf_age$table)
+results_pf_age$FDR <- p.adjust(results_pf_age$PValue, method="fdr")
+
+results_up_pf_age <- subset(results_pf_age, logFC > 0)
+results_up_pf_age <- subset(results_up_pf_age, FDR < 0.1)
+results_up_pf_age$logpval <- -log10(results_up_pf_age$PValue)
+
+results_down_pf_age <- subset(results_pf_age, logFC < 0)
+results_down_pf_age <- subset(results_down_pf_age, FDR < 0.1)
+results_down_pf_age$logpval <- -log10(results_down_pf_age$PValue)
+
+results_pf_age$deexpressed <- ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC >= 0, "UP",
+                                     ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC < 0, "DOWN", "NO"))
+
+results_pf_age$gene <- rownames(results_pf_age)
+results_pf_age$genename <- ifelse(results_pf_age$gene == "PF3D7_0424600", "PfPHISTb",
+                                  ifelse(results_pf_age$gene == "PF3D7_1202900", "PfHMGB1",
+                                         ifelse(results_pf_age$gene == "PF3D7_0527500", "PfHIP",
+                                                ifelse(results_pf_age$gene == "PF3D7_1138500", "PfPPM2",
+                                                       ifelse(results_pf_age$gene == "PF3D7_1343700", "PfK13",
+                                                              ifelse(results_pf_age$gene == "PF3D7_0813000", "PfKIC7",
+                                                                     ifelse(results_pf_age$gene == "PF3D7_0112700", "28S ribosome",
+                                                                            ifelse(results_pf_age$gene == "PF3D7_1116800", "HSP101",
+                                                                                   ifelse(results_pf_age$gene == "PF3D7_1204500", "PfSNAPc",
+                                                                                          ifelse(results_pf_age$gene == "PF3D7_1314200", "PfTERT",
+                                                                                                 ifelse(results_pf_age$gene == "PF3D7_1233900", "PfSENP1", 
+                                                                                                        ifelse(results_pf_age$gene == "PF3D7_0705000", "mRNA cap",
+                                                                                                               ifelse(results_pf_age$gene == "PF3D7_1147800", "PfMAEBL", "NA")))))))))))))
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+mygenes <- c("PF3D7_0424600", "PF3D7_1202900", "PF3D7_0527500", "PF3D7_1138500", "PF3D7_1343700", "PF3D7_0813000", "PF3D7_0112700", "PF3D7_1116800", "PF3D7_1204500", "PF3D7_1314200", "PF3D7_1233900", "PF3D7_0705000", "PF3D7_1147800")
+#ggplot(results_pf_age, aes(x = logFC, y = -log10(PValue), col = deexpressed)) +
+#  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+mygenes <- c("PF3D7_1314200", "PF3D7_1012900", "PF3D7_1116800", "PF3D7_1453700", "PF3D7_1455100", "PF3D7_0112700")
+results_pf_age$genename <- ifelse(results_pf_age$gene == "PF3D7_1012900", "PfATG18",
+                                  ifelse(results_pf_age$gene == "PF3D7_1116800", "PfHSP101", 
+                                         ifelse(results_pf_age$gene == "PF3D7_1453700", "PfP23",
+                                                ifelse(results_pf_age$gene == "PF3D7_1455100", "PfPTP1",
+                                                       ifelse(results_pf_age$gene == "PF3D7_0112700", "28S ribosome",
+                                                              ifelse(results_pf_age$gene == "PF3D7_1314200", "PfTERT", "NA"))))))
+
+ggplot(results_pf_age) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_pf_age %>% 
+                    filter(rownames(results_pf_age) %in% mygenes), 
+                  aes(label = genename, x = logFC, y = -log10(PValue)), size = 4, max.overlaps = 30) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+
+df <- data.frame(cbind(stages, all_age))
+summary(lm(M ~ age, data = df))
+
+ggplot(df, aes(x = M, y = age)) + 
+  geom_point() + 
+  geom_smooth(method='lm', se = FALSE, col = "red") + 
+  theme_classic() + 
+  ylab("Age") + 
+  xlab("Proportion of Male Gametocytes") + 
+  theme(text = element_text(size = 30)) + 
+  annotate("text", x = 0.03, y = 16, label = "Rsqr = 0.05, p = 0.0093", size = 8)
+
+```
+
+Section 5: Host and parasite gene expression associated with the number of subsequent infections
+Figures: Supplemental 8, Supplemental 9
+Tables: Supplemental 3, Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infections$name <- paste("X", infections$id, sep="")
+infections$name <- paste0(infections$name, ".subset.human.rmdup.bam")
+infections_num <- subset(infections, infections$Include_for_number == "Yes")
+infections_num <- subset(infections, infections$persontime >= 3)
+infection_list_num <- as.list(infections_num$name)
+
+counts_num <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% infection_list_num] 
+counts_num[] <- sapply(counts_num, as.numeric)
+rownames(counts_num) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_num)){
+  colnames(counts_num)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_num)[col])
+}
+
+for ( col in 1:ncol(counts_num)){
+  colnames(counts_num)[col] <-  sub("*X", "", colnames(counts_num)[col])
+}
+
+##Sort in same order
+infections_num <- infections_num[ order(match(infections_num$id, colnames(counts_num))), ]
+
+all <- read.csv("mali_samples_allvariables.csv")
+all_num <- all[all$id %in% colnames(counts_num),]
+
+counts_num <- counts_num[,colnames(counts_num) %in% all_num$id]
+all_num <- all_num[ order(match(all_num$id, colnames(counts_num))), ]
+
+##Create DGList
+dgList_num_human <- DGEList(counts=counts_num, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_num_human)>10) >= (ncol(dgList_num_human$counts)/2)
+table(keep)
+dgList_human_num_filter <- dgList_num_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_num_filter))
+dim(dgList_human_num_filter)
+
+##Normalize
+dgList_human_num_filter <- calcNormFactors(dgList_human_num_filter, method="TMM")
+
+##DIFFERENTIAL GENE EXPRESSION BY NUMBER OF SUBSEQUENT INFECTIONS
+no_inf <- infections_num$infections_per_persontime
+dgList_human_num_filter$samples$group <- no_inf
+
+parasitemia <- as.numeric(log(all_num$parasitemiepf))
+sex <- factor(all_num$gender)
+age <- (all_num$year.x + 2000) - all_num$yearob
+month <- all_num$month.x
+
+##Unadjusted model for immune cell composition
+design_num <- model.matrix(~dgList_human_num_filter$samples$group + parasitemia + sex + age + month)
+rownames(design_num) <- colnames(dgList_human_num_filter)
+design_num
+
+##Estimate dispersion 
+y_num <- estimateDisp(dgList_human_num_filter)
+
+fit_num <- glmFit(y_num, design_num)
+lrt_num <- glmLRT(fit_num, coef = 2)
+
+results_num <- as.data.frame(lrt_num$table)
+results_num$FDR <- p.adjust(results_num$PValue, method="BH")
+
+results_up_num <- subset(results_num, logFC > 0)
+results_up_num <- subset(results_up_num, FDR < 0.1)
+results_up_num$logpval <- -log10(results_up_num$PValue)
+
+results_down_num <- subset(results_num, logFC < 0)
+results_down_num <- subset(results_down_num, FDR < 0.1)
+results_down_num$logpval <- -log10(results_down_num$PValue)
+
+results_num$deexpressed <- ifelse(results_num$FDR <= 0.1 & results_num$logFC >= 0, "UP", 
+                                  ifelse(results_num$FDR <= 0.1 & results_num$logFC < 0, "DOWN", "NO"))
+results_num$gene <- rownames(results_num)
+
+mygenes <- c("GK5", "TRPS1", "ENTPD7", "ADGRE1", "GALM", "VAMP5", "MYO7B", "CXCL10", "CALHM6", "PLAAT4", "SOCS1", "CMC2", "SEPTIN4")
+
+mycolors <- c("blue", "red", "black")
+
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_num) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_num %>% 
+                    filter(rownames(results_num) %in% mygenes), 
+                  aes(label = gene, x = logFC, y = -log10(PValue)), size = 4) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+
+##Pf
+#Read in count table
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_num <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_num)){
+  colnames(counts_pf_num)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_num)[col])
+}
+
+for ( col in 1:ncol(counts_pf_num)){
+  colnames(counts_pf_num)[col] <-  sub("*X", "", colnames(counts_pf_num)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infections_num <- subset(infections, infections$Include_for_number == "Yes")
+infections_num <- subset(infections, infections$persontime >= 3)
+infection_list_num <- as.list(infections_num$id)
+
+counts_pf_num <- counts_pf_num[,colnames(counts_pf_num) %in% infection_list_num] 
+counts_pf_num[] <- sapply(counts_pf_num, as.numeric)
+rownames(counts_pf_num) <- pf_counts_all.txt$Geneid
+
+infections_num <- infections_num[ order(match(infections_num$id, colnames(counts_pf_num))), ]
+
+all_num <- read.csv("mali_samples_allvariables.csv")
+all_num <- all_num[all_num$id %in% colnames(counts_pf_num),]
+
+counts_pf_num <- counts_pf_num[,colnames(counts_pf_num) %in% all_num$id]
+all_num <- all_num[ order(match(all_num$id, colnames(counts_pf_num))), ]
+
+##Create DGList
+dgList_pf_num <- DGEList(counts=counts_pf_num, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_num)>10) >= (ncol(dgList_pf_num$counts)/2)
+table(keep)
+dgListfilter_pf_num <- dgList_pf_num[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_num))
+dim(dgListfilter_pf_num)
+
+##Normalize
+dgListfilter_pf_num <- calcNormFactors(dgListfilter_pf_num, method="TMM")
+
+##Correlate number of subsequent infections per persontime with gene expression
+no_inf <- infections_num$infections_per_persontime
+
+dgListfilter_pf_num$samples$group <- no_inf
+
+parasitemia <- as.numeric(log(all_num$parasitemiepf))
+sex <- factor(all_num$gender)
+age <- (all_num$year.x + 2000) - all_num$yearob
+month <- all_num$month.x
+
+##Unadjusted model for immune cell composition
+design_pf_num <- model.matrix(~dgListfilter_pf_num$samples$group + parasitemia + sex + age)
+rownames(design_pf_num) <- colnames(dgListfilter_pf_num)
+design_pf_num
+
+##Estimate dispersion 
+y_pf_num <- estimateDisp(dgListfilter_pf_num)
+
+fit_pf_num <- glmFit(y_pf_num, design_pf_num)
+lrt_pf_num <- glmLRT(fit_pf_num, coef = 2)
+topTags(lrt_pf_num)
+summary(decideTests(lrt_pf_num))
+
+results_pf_num <- as.data.frame(lrt_pf_num$table)
+results_pf_num$FDR <- p.adjust(results_pf_num$PValue, method="fdr")
+
+results_up_pf_num <- subset(results_pf_num, logFC > 0)
+results_up_pf_num <- subset(results_up_pf_num, FDR < 0.1)
+results_up_pf_num$logpval <- -log10(results_up_pf_num$PValue)
+
+results_down_pf_num <- subset(results_pf_num, logFC < 0)
+results_down_pf_num <- subset(results_down_pf_num, FDR < 0.1)
+results_down_pf_num$logpval <- -log10(results_down_pf_num$PValue)
+
+results_pf_num$deexpressed <- ifelse(results_pf_num$FDR <= 0.1 & results_pf_num$logFC >= 0, "UP", 
+                                     ifelse(results_pf_num$FDR <= 0.1 & results_pf_num$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_num, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+##Ggplot with labeled genes
+mygenes <- c("PF3D7_1127000", "PF3D7_1002200", "PF3D7_1222600", "PF3D7_1200900", "PF3D7_0113600", "PF3D7_1302100")
+names(mygenes) <- c("Protein phosphatase (putative)", "PArt", "AP2-G", "PHISTc", "SURF1.2 (pseudogene)", "G27/25")
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_num) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_pf_num %>% 
+                    filter(rownames(results_pf_num) %in% mygenes), 
+                  aes(label = names(mygenes), x = logFC, y = -log10(PValue)), size = 4) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+```
+
+Section 6: Host and parasite gene expression associated with time to the next symptomatic infection
+Figures: 
+Tables: Supplemental 3, Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+library(variancePartition)
+
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+infections_time <- read.delim("subsequent_infections_edit.txt", header = T)
+infections_time$name <- paste("X", infections_time$id, sep="")
+infections_time$name <- paste0(infections_time$name, ".subset.human.rmdup.bam")
+infections_time <- subset(infections_time, infections_time$time_to_next_sympto_infection != "NA")
+infections_time <- subset(infections_time, infections_time$persontime >= 3)
+infection_list_time <- as.list(infections_time$name)
+
+counts_time <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% infection_list_time] 
+counts_time[] <- sapply(counts_time, as.numeric)
+rownames(counts_time) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_time)){
+  colnames(counts_time)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_time)[col])
+}
+
+for ( col in 1:ncol(counts_time)){
+  colnames(counts_time)[col] <-  sub("*X", "", colnames(counts_time)[col])
+}
+
+##Sort in same order
+infections_time <- infections_time[ order(match(infections_time$id, colnames(counts_time))), ]
+
+all_time <- read.csv("mali_samples_allvariables.csv")
+all_time <- all_time[all_time$id %in% colnames(counts_time),]
+
+counts_time <- counts_time[,colnames(counts_time) %in% all_time$id]
+all_time <- all_time[ order(match(all_time$id, colnames(counts_time))), ]
+
+##Create DGList
+dgList_time_human <- DGEList(counts=counts_time, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_time_human)>10) >= (ncol(dgList_time_human$counts)/2)
+table(keep)
+dgList_human_time_filter <- dgList_time_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_time_filter))
+dim(dgList_human_time_filter)
+
+##Normalize
+dgList_human_time_filter <- calcNormFactors(dgList_human_time_filter, method="TMM")
+
+##Correlate number of subsequent infections per persontime with gene expression
+time_to_inf <- infections_time$time_to_next_sympto_infection
+dgList_human_time_filter$samples$group <- time_to_inf
+
+parasitemia <- as.numeric(log(all_time$parasitemiepf))
+sex <- factor(all_time$gender)
+age <- (all_time$year.x + 2000) - all_time$yearob
+
+##Unadjusted model for immune cell composition
+design_time <- model.matrix(~dgList_human_time_filter$samples$group + parasitemia + sex + age)
+rownames(design_time) <- colnames(dgList_human_time_filter)
+design_time
+
+##Estimate dispersion 
+y_time <- estimateDisp(dgList_human_time_filter)
+
+fit_time <- glmFit(y_time, design_time)
+lrt_time <- glmLRT(fit_time, coef = 2)
+topTags(lrt_time)
+summary(decideTests(lrt_time))
+
+results_time <- as.data.frame(lrt_time$table)
+results_time$FDR <- p.adjust(results_time$PValue, method="BH")
+
+results_up_time <- subset(results_time, logFC > 0)
+results_up_time <- subset(results_up_time, FDR < 0.1)
+results_up_time$logpval <- -log10(results_up_time$PValue)
+
+results_down_time <- subset(results_time, logFC < 0)
+results_down_time <- subset(results_down_time, FDR < 0.1)
+results_down_time$logpval <- -log10(results_down_time$PValue)
+
+results_time$deexpressed <- ifelse(results_time$FDR <= 0.1 & results_time$logFC >= 0, "UP", 
+                                   ifelse(results_time$FDR <= 0.1 & results_time$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_time, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+##Pf
+#Read in count table
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_time <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_time)){
+  colnames(counts_pf_time)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_time)[col])
+}
+
+for ( col in 1:ncol(counts_pf_time)){
+  colnames(counts_pf_time)[col] <-  sub("*X", "", colnames(counts_pf_time)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infections_time <- subset(infections, infections$persontime >= 3)
+infections_time <- subset(infections_time, infections_time$time_to_next_sympto_infection != "NA")
+infection_list_time <- as.list(infections_time$id)
+
+counts_pf_time <- counts_pf_time[,colnames(counts_pf_time) %in% infection_list_time] 
+counts_pf_time[] <- sapply(counts_pf_time, as.numeric)
+rownames(counts_pf_time) <- pf_counts_all.txt$Geneid
+
+infections_time <- infections_time[ order(match(infections_time$id, colnames(counts_pf_time))), ]
+
+all_time <- read.csv("mali_samples_allvariables.csv")
+all_time <- all_time[all_time$id %in% colnames(counts_pf_time),]
+all_time <- all_time[ order(match(all_time$id, colnames(counts_pf_time))), ]
+
+##Create DGList
+dgList_pf_time <- DGEList(counts=counts_pf_time, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_time)>10) >= (ncol(dgList_pf_time$counts)/2)
+table(keep)
+dgListfilter_pf_time <- dgList_pf_time[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_time))
+dim(dgListfilter_pf_time)
+
+##Normalize
+dgListfilter_pf_time <- calcNormFactors(dgListfilter_pf_time, method="TMM")
+
+##DIFFERENTIAL EXPRESSION BY TIME TO NEXT SUBSEQUENT INFECTION
+time_to_inf <- infections_time$time_to_next_sympto_infection
+
+dgListfilter_pf_time$samples$group <- time_to_inf
+
+parasitemia <- as.numeric(log(all_time$parasitemiepf))
+sex <- factor(all_time$gender)
+age <- (all_time$year.x + 2000) - all_time$yearob
+
+##Unadjusted model for immune cell composition
+design_pf_time <- model.matrix(~dgListfilter_pf_time$samples$group + parasitemia + sex + age)
+rownames(design_pf_time) <- colnames(dgListfilter_pf_time)
+design_pf_time
+
+##Estimate dispersion 
+y_pf_time <- estimateDisp(dgListfilter_pf_time)
+
+fit_pf_time <- glmFit(y_pf_time, design_pf_time)
+lrt_pf_time <- glmLRT(fit_pf_time, coef = 2)
+topTags(lrt_pf_time)
+summary(decideTests(lrt_pf_time))
+
+results_pf_time <- as.data.frame(lrt_pf_time$table)
+results_pf_time$FDR <- p.adjust(results_pf_time$PValue, method="BH")
+
+results_up_pf_time <- subset(results_pf_time, logFC > 0)
+results_up_pf_time <- subset(results_up_pf_time, FDR < 0.1)
+results_up_pf_time$logpval <- -log10(results_up_pf_time$PValue)
+
+results_down_pf_time <- subset(results_pf_time, logFC < 0)
+results_down_pf_time <- subset(results_down_pf_time, FDR < 0.1)
+results_down_pf_time$logpval <- -log10(results_down_pf_time$PValue)
+
+results_pf_time$deexpressed <- ifelse(results_pf_time$FDR <= 0.1 & results_pf_time$logFC >= 0, "UP", 
+                                      ifelse(results_pf_time$FDR <= 0.1 & results_pf_time$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_time, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+```
+
+Section 7: Host and parasite gene expression associated with host sex
+Figures: 
+Tables: Supplemental 3, Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+sample_list <- read.delim("subsequent_infections_edit.txt", header = T)
+sample_list$name <- paste("X", sample_list$id, sep="")
+sample_list$name <- paste0(sample_list$name, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$name)
+
+counts_sex <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts_sex[] <- sapply(counts_sex, as.numeric)
+rownames(counts_sex) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_sex)){
+  colnames(counts_sex)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_sex)[col])
+}
+
+for ( col in 1:ncol(counts_sex)){
+  colnames(counts_sex)[col] <-  sub("*X", "", colnames(counts_sex)[col])
+}
+
+##Create DGList
+dgList_sex_human <- DGEList(counts=counts_sex, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_sex_human)>10) >= (ncol(dgList_sex_human$counts)/2)
+table(keep)
+dgList_human_sex_filter <- dgList_sex_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_sex_filter))
+dim(dgList_human_sex_filter)
+
+##Normalize
+dgList_human_sex_filter <- calcNormFactors(dgList_human_sex_filter, method="TMM")
+
+##Correlate sex with gene expression
+all_sex <- read.csv("mali_samples_allvariables.csv")
+all_sex <- all_sex[all_sex$id %in% colnames(counts_sex),]
+all_sex <- all_sex[ order(match(all_sex$id, colnames(counts_sex))), ]
+
+sex <- all_sex$gender
+dgList_human_sex_filter$samples$group <- sex
+
+parasitemia <- as.numeric(log(all_sex$parasitemiepf))
+sex <- factor(all_sex$gender)
+age <- (all_sex$year.x + 2000) - all_sex$yearob
+month <- all_sex$month.x
+
+#Correlate sex and parasitemia
+ggplot(all_sex, aes(x = factor(gender), y = log(parasitemiepf))) +
+  geom_violin(trim = FALSE, aes(fill = factor(gender))) + 
+  geom_jitter(height = 0, width = 0.1) + 
+  theme_minimal() + theme(text = element_text(size = 20), legend.position = "none") + 
+  xlab("Participant Sex") + ylab("Log Parasitemia") +
+  scale_x_discrete(labels = c("Male", "Female")) + 
+  stat_compare_means(method = "t.test", label.x = 1.2, label.y = 16, size = 10)
+
+##Unadjusted model for immune cell composition
+design_sex <- model.matrix(~dgList_human_sex_filter$samples$group + parasitemia + age + month)
+rownames(design_sex) <- colnames(dgList_human_sex_filter)
+design_sex
+
+design_sex_adj <- model.matrix(~sex + parasitemia + age + month)
+rownames(design_sex_adj) <- colnames(dgList_human_sex_filter)
+design_sex_adj
+
+##Estimate dispersion 
+y_sex <- estimateDisp(dgList_human_sex_filter)
+
+fit_sex <- glmFit(y_sex, design_sex_adj)
+lrt_sex <- glmLRT(fit_sex, coef = 2)
+topTags(lrt_sex)
+summary(decideTests(lrt_sex))
+
+results_sex <- as.data.frame(lrt_sex$table)
+results_sex$FDR <- p.adjust(results_sex$PValue, method="fdr")
+
+results_up_sex <- subset(results_sex, logFC > 0)
+results_up_sex <- subset(results_up_sex, FDR < 0.1)
+results_up_sex$logpval <- -log10(results_up_sex$PValue)
+
+results_down_sex <- subset(results_sex, logFC < 0)
+results_down_sex <- subset(results_down_sex, FDR < 0.1)
+results_down_sex$logpval <- -log10(results_down_sex$PValue)
+
+results_sex$deexpressed <- ifelse(results_sex$FDR <= 0.1 & results_sex$logFC >= 0, "UP", 
+                                   ifelse(results_sex$FDR <= 0.1 & results_sex$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_sex, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+##Ggplot with labeled genes
+mygenes <- c("XIST", "ZFX", "PUDP", "KDM5C", "KDM6A", "EIF2S3", "FCGR2B", "CD37", "PRKY", "DDX3Y", "EIF1AY", "UTY", "TXLNGY", "CD99")
+results_sex$gene <- rownames(results_sex)
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_sex) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_sex %>% 
+                    filter(rownames(results_sex) %in% mygenes), 
+                  aes(label = gene, x = logFC, y = -log10(PValue)), size = 4) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+
+##Pf
+#Read in count table
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_sex <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_sex)){
+  colnames(counts_pf_sex)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_sex)[col])
+}
+
+for ( col in 1:ncol(counts_pf_sex)){
+  colnames(counts_pf_sex)[col] <-  sub("*X", "", colnames(counts_pf_sex)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infection_list_sex <- as.list(infections$id)
+
+counts_pf_sex <- counts_pf_sex[,colnames(counts_pf_sex) %in% infection_list_sex]
+counts_pf_sex[] <- sapply(counts_pf_sex, as.numeric)
+rownames(counts_pf_sex) <- pf_counts_all.txt$Geneid
+
+all_sex <- read.csv("mali_samples_allvariables.csv")
+all_sex <- all_sex[all_sex$id %in% colnames(counts_pf_sex),]
+all_sex <- all_sex[ order(match(all_sex$id, colnames(counts_pf_sex))), ]
+
+##Create DGList
+dgList_pf_sex <- DGEList(counts=counts_pf_sex, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_sex)>10) >= (ncol(dgList_pf_sex$counts)/2)
+table(keep)
+dgListfilter_pf_sex <- dgList_pf_sex[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_sex))
+dim(dgListfilter_pf_sex)
+
+##Normalize
+dgListfilter_pf_sex <- calcNormFactors(dgListfilter_pf_sex, method="TMM")
+
+dgListfilter_pf_sex$samples$group <- all_sex$gender
+
+parasitemia <- as.numeric(log(all_sex$parasitemiepf))
+age <- (all_sex$year.x + 2000) - all_sex$yearob
+
+##Unadjusted model for immune cell composition
+design_pf_sex <- model.matrix(~dgListfilter_pf_sex$samples$group + parasitemia + age)
+rownames(design_pf_sex) <- colnames(dgListfilter_pf_sex)
+design_pf_sex
+
+##Estimate dispersion
+y_pf_sex <- estimateDisp(dgListfilter_pf_sex)
+
+fit_pf_sex <- glmFit(y_pf_sex, design_pf_sex)
+lrt_pf_sex <- glmLRT(fit_pf_sex, coef = 2)
+topTags(lrt_pf_sex)
+summary(decideTests(lrt_pf_sex))
+
+results_pf_sex <- as.data.frame(lrt_pf_sex$table)
+results_pf_sex$FDR <- p.adjust(results_pf_sex$PValue, method="fdr")
+
+results_up_pf_sex <- subset(results_pf_sex, logFC > 0)
+results_up_pf_sex <- subset(results_up_pf_sex, FDR < 0.1)
+results_up_pf_sex$logpval <- -log10(results_up_pf_sex$PValue)
+
+results_down_pf_sex <- subset(results_pf_sex, logFC < 0)
+results_down_pf_sex <- subset(results_down_pf_sex, FDR < 0.1)
+results_down_pf_sex$logpval <- -log10(results_down_pf_sex$PValue)
+
+results_pf_sex$deexpressed <- ifelse(results_pf_sex$FDR <= 0.1 & results_pf_sex$logFC >= 0, "UP",
+                                      ifelse(results_pf_sex$FDR <= 0.1 & results_pf_sex$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_sex, aes(x = logFC, y = -log10(PValue), col = deexpressed)) +
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+##Ggplot with labeled genes
+mygenes <- c("PF3D7_0831800")
+names(mygenes) <- c("PfHRP2")
+results_pf_sex$gene <- rownames(results_pf_sex)
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_sex) + 
+  geom_point(aes(logFC,-log10(PValue),col= deexpressed, alpha = 0.1)) +
+  geom_text_repel(data = results_pf_sex %>% 
+                    filter(rownames(results_pf_sex) %in% mygenes), 
+                  aes(label = names(mygenes), x = logFC, y = -log10(PValue)), size = 4) +
+  scale_color_manual(values=mycolors) + 
+  theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+```
+
+Section 8: Host and parasite gene expression associated with complexity of infection
+Tables: Supplemental 3, Supplemental 5
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+sample_list <- read.delim("subsequent_infections_edit.txt", header = T)
+sample_list$name <- paste("X", sample_list$id, sep="")
+sample_list$name <- paste0(sample_list$name, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$name)
+
+counts_coi <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts_coi[] <- sapply(counts_coi, as.numeric)
+rownames(counts_coi) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_coi)){
+  colnames(counts_coi)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_coi)[col])
+}
+
+for ( col in 1:ncol(counts_coi)){
+  colnames(counts_coi)[col] <-  sub("*X", "", colnames(counts_coi)[col])
+}
+
+##Create DGList
+dgList_coi_human <- DGEList(counts=counts_coi, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_coi_human)>10) >= (ncol(dgList_coi_human$counts)/2)
+table(keep)
+dgList_human_coi_filter <- dgList_coi_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_coi_filter))
+dim(dgList_human_coi_filter)
+
+##Normalize
+dgList_human_coi_filter <- calcNormFactors(dgList_human_coi_filter, method="TMM")
+
+##Correlate sex with gene expression
+coi <- read.delim("coi_v1.txt", header = TRUE)
+coi <- coi[coi$Sample %in% colnames(counts_coi),]
+coi$id <- coi$Sample
+
+all_coi <- read.csv("mali_samples_allvariables.csv")
+all_coi <- all_coi[all_coi$id %in% colnames(counts_coi),]
+all_coi <- all_coi[ order(match(all_coi$id, colnames(counts_coi))), ]
+
+comp <- factor(coi$fws_call)
+
+dgList_human_coi_filter$samples$group <- comp
+
+parasitemia <- as.numeric(log(all_coi$parasitemiepf))
+sex <- factor(all_coi$gender)
+age <- as.numeric((all_coi$year.x + 2000) - all_coi$yearob)
+
+##Unadjusted model for immune cell composition
+design_coi <- model.matrix(~dgList_human_coi_filter$samples$group + parasitemia + sex + age)
+rownames(design_coi) <- colnames(dgList_human_coi_filter)
+design_coi
+
+##Estimate dispersion 
+y_coi <- estimateDisp(dgList_human_coi_filter)
+
+fit_coi <- glmFit(y_coi, design_coi)
+lrt_coi <- glmLRT(fit_coi, coef = 2)
+topTags(lrt_coi)
+summary(decideTests(lrt_coi))
+
+results_coi <- as.data.frame(lrt_coi$table)
+results_coi$FDR <- p.adjust(results_coi$PValue, method="BH")
+
+results_up_coi <- subset(results_coi, logFC > 0)
+results_up_coi <- subset(results_up_coi, FDR < 0.1)
+results_up_coi$logpval <- -log10(results_up_coi$PValue)
+
+results_down_coi <- subset(results_coi, logFC < 0)
+results_down_coi <- subset(results_down_coi, FDR < 0.1)
+results_down_coi$logpval <- -log10(results_down_coi$PValue)
+
+results_coi$deexpressed <- ifelse(results_coi$FDR <= 0.1 & results_coi$logFC >= 0, "UP", 
+                                  ifelse(results_coi$FDR <= 0.1 & results_coi$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_coi, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+##Pf
+#Read in count table
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_coi <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_coi)){
+  colnames(counts_pf_coi)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_coi)[col])
+}
+
+for ( col in 1:ncol(counts_pf_coi)){
+  colnames(counts_pf_coi)[col] <-  sub("*X", "", colnames(counts_pf_coi)[col])
+}
+
+##Subset by project
+coi <- read.delim("coi_v1.txt", header = TRUE)
+coi <- coi[coi$Sample %in% colnames(counts_pf_coi),]
+
+counts_pf_coi <- counts_pf_coi[,colnames(counts_pf_coi) %in% coi$Sample]
+counts_pf_coi[] <- sapply(counts_pf_coi, as.numeric)
+rownames(counts_pf_coi) <- pf_counts_all.txt$Geneid
+
+all_coi <- read.csv("mali_samples_allvariables.csv")
+all_coi <- all_coi[all_coi$id %in% colnames(counts_pf_coi),]
+all_coi <- all_coi[ order(match(all_coi$id, colnames(counts_pf_coi))), ]
+
+##Create DGList
+dgList_pf_coi <- DGEList(counts=counts_pf_coi, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_coi)>10) >= (ncol(dgList_pf_coi$counts)/2)
+table(keep)
+dgListfilter_pf_coi <- dgList_pf_coi[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_coi))
+dim(dgListfilter_pf_coi)
+
+##Normalize
+dgListfilter_pf_coi <- calcNormFactors(dgListfilter_pf_coi, method="TMM")
+
+comp <- factor(coi$fws_call)
+dgListfilter_pf_coi$samples$group <- comp
+
+parasitemia <- as.numeric(log(all_coi$parasitemiepf))
+sex <- factor(all_coi$gender)
+age <- (all_coi$year.x + 2000) - all_coi$yearob
+
+##Unadjusted model for immune cell composition
+design_pf_coi <- model.matrix(~dgListfilter_pf_coi$samples$group + parasitemia + sex + age)
+rownames(design_pf_coi) <- colnames(dgListfilter_pf_coi)
+design_pf_coi
+
+stages <- read.csv("pf_symptomatic_deconv.csv")
+names(stages)[names(stages) == 'Mixture'] <- 'id'
+stages <- stages[stages$id %in% all$id,]
+stages <- stages[ order(match(stages$id, all$id)), ]
+ring <- stages$ring
+troph <- stages$troph
+schiz <- stages$schiz
+M <- stages$M
+
+design_pf_age_adj <- model.matrix(~dgListfilter_pf_age$samples$group + parasitemia + sex + ring + troph + schiz + M)
+rownames(design_pf_age_adj) <- colnames(dgListfilter_pf_age)
+design_pf_age_adj
+
+##Estimate dispersion
+y_pf_coi <- estimateDisp(dgListfilter_pf_coi)
+
+fit_pf_coi <- glmFit(y_pf_coi, design_pf_coi)
+lrt_pf_coi <- glmLRT(fit_pf_coi, coef = 2)
+topTags(lrt_pf_coi)
+summary(decideTests(lrt_pf_coi))
+
+results_pf_coi <- as.data.frame(lrt_pf_coi$table)
+results_pf_coi$FDR <- p.adjust(results_pf_coi$PValue, method="fdr")
+
+results_up_pf_coi <- subset(results_pf_coi, logFC > 0)
+results_up_pf_coi <- subset(results_up_pf_coi, FDR < 0.1)
+results_up_pf_coi$logpval <- -log10(results_up_pf_coi$PValue)
+
+results_down_pf_coi <- subset(results_pf_coi, logFC < 0)
+results_down_pf_coi <- subset(results_down_pf_coi, FDR < 0.1)
+results_down_pf_coi$logpval <- -log10(results_down_pf_coi$PValue)
+
+results_pf_coi$deexpressed <- ifelse(results_pf_coi$FDR <= 0.1 & results_pf_coi$logFC >= 0, "UP",
+                                     ifelse(results_pf_coi$FDR <= 0.1 & results_pf_coi$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_coi, aes(x = logFC, y = -log10(PValue), col = deexpressed)) +
+  geom_point() + scale_colour_manual(values = mycolors) + theme_minimal() + theme(text = element_text(size = 20))
+
+
+```
+
+Section 9: Host and parasite gene expression associated with parasitemia, restricted to one age range
+Figures: Supplemental 4, Supplemental 5
+Tables: Supplemental 6
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+
+##Correlate parasitemia with gene expression within one age range (age 4-5) 
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+sample_list <- read.delim("subsequent_infections_edit.txt", header = T)
+sample_list$name <- paste("X", sample_list$id, sep="")
+sample_list$name <- paste0(sample_list$name, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$name)
+
+counts_age <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts_age[] <- sapply(counts_age, as.numeric)
+rownames(counts_age) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_age)[col])
+}
+
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub("*X", "", colnames(counts_age)[col])
+}
+
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age$age <- as.numeric((all_age$year.x + 2000) - all_age$yearob)
+all_age <- all_age[all_age$id %in% colnames(counts_age),]
+
+all_age <- subset(all_age, age == 4 | age == 5)
+
+counts_age <- counts_age[,colnames(counts_age) %in% all_age$id]
+all_age <- all_age[ order(match(all_age$id, colnames(counts_age))), ]
+
+##Create DGList
+dgList_age_human <- DGEList(counts=counts_age, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_age_human)>10) >= (ncol(dgList_age_human$counts)/2)
+table(keep)
+dgList_human_age_filter <- dgList_age_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_age_filter))
+dim(dgList_human_age_filter)
+
+##Normalize
+dgList_human_age_filter <- calcNormFactors(dgList_human_age_filter, method="TMM")
+
+dgList_human_age_filter$samples$group <- log(all_age$parasitemiepf)
+
+sex <- factor(all_age$gender)
+month <- factor(all_age$month.x)
+
+##Unadjusted model for immune cell composition
+design_age <- model.matrix(~dgList_human_age_filter$samples$group + sex + month)
+rownames(design_age) <- colnames(dgList_human_age_filter)
+design_age
+
+immune_cells <- read.csv("human_symptomatic_deconvresults.csv")
+immune_cells <- immune_cells[immune_cells$Mixture %in% colnames(dgList_human_age_filter$counts),]
+immune_cells <- immune_cells[ order(match(immune_cells$Mixture, colnames(dgList_human_age_filter$counts))), ]
+
+age <- (all_age$year.x + 2000) - all_age$yearob
+sex <- as.factor(all_age$gender)
+B <- immune_cells$B
+pc <- immune_cells$Plasma.cells
+t <- immune_cells$T
+nk <- immune_cells$NK
+mono <- immune_cells$Monocytes
+neut <- immune_cells$Neutrophils
+
+design_age_adj <- model.matrix(~dgList_human_age_filter$samples$group + month + sex + B + pc + t + nk + mono + neut)
+rownames(design_age_adj) <- colnames(dgList_human_age_filter)
+design_age_adj
+
+##Estimate dispersion 
+y_age <- estimateDisp(dgList_human_age_filter)
+
+fit_age <- glmFit(y_age, design_age)
+lrt_age <- glmLRT(fit_age, coef = 2)
+topTags(lrt_age)
+#summary(decideTests(lrt_age))
+
+results_age <- as.data.frame(lrt_age$table)
+results_age$FDR <- p.adjust(results_age$PValue, method="fdr")
+
+results_up_age <- subset(results_age, logFC > 0)
+results_up_age <- subset(results_up_age, FDR < 0.1)
+results_up_age$logpval <- -log10(results_up_age$PValue)
+
+results_down_age <- subset(results_age, logFC < 0)
+results_down_age <- subset(results_down_age, FDR < 0.1)
+results_down_age$logpval <- -log10(results_down_age$PValue)
+
+results_age$deexpressed <- ifelse(results_age$FDR <= 0.1 & results_age$logFC >= 0, "UP", 
+                                  ifelse(results_age$FDR <= 0.1 & results_age$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_age, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+##Compare genes from all ages to one age
+genes_allages_adj <- read.delim("parasitemia_allages_adjusted.txt", sep = "\t")
+genes_oneage_adj <- read.delim("parasitemia_oneage_adjusted.txt", sep = "\t")
+
+interesting_genes <- as.data.frame(setdiff(rownames(genes_oneage_adj), rownames(genes_allages_adj)))
+
+##Correlate parasitemia with gene expression within one age range (age 4-5) (pf)
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_age <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_age)[col])
+}
+
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub("*X", "", colnames(counts_pf_age)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infection_list_age <- as.list(infections$id)
+
+counts_pf_age <- counts_pf_age[,colnames(counts_pf_age) %in% infection_list_age]
+counts_pf_age[] <- sapply(counts_pf_age, as.numeric)
+rownames(counts_pf_age) <- pf_counts_all.txt$Geneid
+
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age <- all_age[all_age$id %in% colnames(counts_pf_age),]
+all_age$age <- (all_age$year.x + 2000) - all_age$yearob
+all_age <- subset(all_age, age == 5 | age == 4)
+counts_pf_age <- counts_pf_age[,colnames(counts_pf_age) %in% all_age$id]
+all_age <- all_age[ order(match(all_age$id, colnames(counts_pf_age))), ]
+
+##Create DGList
+dgList_pf_age <- DGEList(counts=counts_pf_age, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_age)>10) >= (ncol(dgList_pf_age$counts)/2)
+table(keep)
+dgListfilter_pf_age <- dgList_pf_age[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_age))
+dim(dgListfilter_pf_age)
+
+##Normalize
+dgListfilter_pf_age <- calcNormFactors(dgListfilter_pf_age, method="TMM")
+
+month <- factor(all_age$month.x)
+dgListfilter_pf_age$samples$group <- log(all_age$parasitemiepf)
+
+sex <- factor(all_age$gender)
+month <- factor(all_age$month.x)
+
+##Unadjusted model for immune cell composition
+design_pf_age <- model.matrix(~dgListfilter_pf_age$samples$group + sex + month)
+rownames(design_pf_age) <- colnames(dgListfilter_pf_age)
+design_pf_age
+
+stages <- read.csv("pf_symptomatic_deconv.csv")
+names(stages)[names(stages) == 'Mixture'] <- 'id'
+stages <- stages[stages$id %in% all_age$id,]
+stages <- stages[ order(match(stages$id, all_age$id)), ]
+ring <- stages$ring
+troph <- stages$troph
+schiz <- stages$schiz
+M <- stages$M
+
+design_pf_age_adj <- model.matrix(~dgListfilter_pf_age$samples$group + sex + month + ring + troph + schiz + M)
+rownames(design_pf_age_adj) <- colnames(dgListfilter_pf_age)
+design_pf_age_adj
+
+##Estimate dispersion
+y_pf_age <- estimateDisp(dgListfilter_pf_age)
+
+fit_pf_age <- glmFit(y_pf_age, design_pf_age_adj)
+lrt_pf_age <- glmLRT(fit_pf_age, coef = 2)
+topTags(lrt_pf_age)
+summary(decideTests(lrt_pf_age))
+
+results_pf_age <- as.data.frame(lrt_pf_age$table)
+results_pf_age$FDR <- p.adjust(results_pf_age$PValue, method="fdr")
+
+results_up_pf_age <- subset(results_pf_age, logFC > 0)
+results_up_pf_age <- subset(results_up_pf_age, FDR < 0.1)
+results_up_pf_age$logpval <- -log10(results_up_pf_age$PValue)
+
+results_down_pf_age <- subset(results_pf_age, logFC < 0)
+results_down_pf_age <- subset(results_down_pf_age, FDR < 0.1)
+results_down_pf_age$logpval <- -log10(results_down_pf_age$PValue)
+
+results_pf_age$deexpressed <- ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC >= 0, "UP",
+                                     ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_age, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+allgenes <- read.delim("parasitemia_allages_pf.txt", sep = "\t")
+oneage <- read.delim("parasitemia_oneage_pf.txt", sep = "\t")
+
+interesting_genes <- as.data.frame(setdiff(rownames(oneage), rownames(allgenes)))
+```
+
+Section 10: Host and parasite gene expression associated with age, restricted to certain parasitemia levels
+```{r}
+library(edgeR)
+library(ggplot2)
+library(stringr)
+library(pcaMethods)
+library(mixOmics)
+library(tidyverse)
+library(dplyr)
+
+##Genes associated with age independent of parasitemia
+##Human 
+
+##Read in counts, remove globin genes
+human_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/human_counts_all.txt.gz", comment.char="#")
+globin_genes <- c("HBB", "HBD", "HBA1", "HBA2", "HBE1", "HBEGF", "HBG1", "HBG2", "HBM", "HBQ1", "HBZ")
+human_counts_all.txt <- human_counts_all.txt[!(human_counts_all.txt$Geneid %in% globin_genes),]
+
+##Subset by project
+sample_list <- read.delim("subsequent_infections_edit.txt", header = T)
+sample_list$name <- paste("X", sample_list$id, sep="")
+sample_list$name <- paste0(sample_list$name, ".subset.human.rmdup.bam")
+sample_list <- as.list(sample_list$name)
+
+counts_age <- human_counts_all.txt[,colnames(human_counts_all.txt) %in% sample_list] 
+counts_age[] <- sapply(counts_age, as.numeric)
+rownames(counts_age) <- human_counts_all.txt$Geneid
+
+##Clean up column names
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub(".subset.human.rmdup.bam*", "", colnames(counts_age)[col])
+}
+
+for ( col in 1:ncol(counts_age)){
+  colnames(counts_age)[col] <-  sub("*X", "", colnames(counts_age)[col])
+}
+
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age <- all_age[all_age$id %in% colnames(counts_age),]
+all_age$age <- as.numeric((all_age$year.x + 2000) - all_age$yearob)
+all_age$parasitemia <- log(all_age$parasitemiepf)
+
+#Restrict to parasitemias within 1 log range
+all_age_sub <- subset (all_age, parasitemia >= 12 & parasitemia <= 13)
+
+counts_age_sub <- counts_age[,colnames(counts_age) %in% all_age_sub$id]
+all_age_sub <- all_age_sub[ order(match(all_age_sub$id, colnames(counts_age_sub))), ]
+
+
+
+##Create DGList
+dgList_age_human <- DGEList(counts=counts_age_sub, genes=human_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_age_human)>10) >= (ncol(dgList_age_human$counts)/2)
+table(keep)
+dgList_human_age_filter <- dgList_age_human[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgList_human_age_filter))
+dim(dgList_human_age_filter)
+
+##Normalize
+dgList_human_age_filter <- calcNormFactors(dgList_human_age_filter, method="TMM")
+
+dgList_human_age_filter$samples$group <- all_age_sub$age
+
+sex <- factor(all_age_sub$gender)
+month <- factor(all_age_sub$month.x)
+
+##Unadjusted model for immune cell composition
+design_age <- model.matrix(~dgList_human_age_filter$samples$group + sex + month)
+rownames(design_age) <- colnames(dgList_human_age_filter)
+design_age
+
+immune_cells <- read.csv("human_symptomatic_deconvresults.csv")
+immune_cells_sub <- immune_cells[immune_cells$Mixture %in% colnames(dgList_human_age_filter$counts),]
+immune_cells_sub <- immune_cells_sub[ order(match(immune_cells_sub$Mixture, colnames(dgList_human_age_filter$counts))), ]
+
+sex <- as.factor(all_age_sub$gender)
+B <- immune_cells_sub$B
+pc <- immune_cells_sub$Plasma.cells
+t <- immune_cells_sub$T
+nk <- immune_cells_sub$NK
+mono <- immune_cells_sub$Monocytes
+neut <- immune_cells_sub$Neutrophils
+
+design_age_adj <- model.matrix(~dgList_human_age_filter$samples$group + month + sex + B + pc + t + nk + mono + neut)
+rownames(design_age_adj) <- colnames(dgList_human_age_filter)
+design_age_adj
+
+##Estimate dispersion 
+y_age <- estimateDisp(dgList_human_age_filter)
+
+fit_age <- glmFit(y_age, design_age)
+lrt_age <- glmLRT(fit_age, coef = 2)
+topTags(lrt_age)
+
+results_age <- as.data.frame(lrt_age$table)
+results_age$FDR <- p.adjust(results_age$PValue, method="fdr")
+
+results_up_age <- subset(results_age, logFC > 0)
+results_up_age <- subset(results_up_age, FDR < 0.1)
+results_up_age$logpval <- -log10(results_up_age$PValue)
+
+results_down_age <- subset(results_age, logFC < 0)
+results_down_age <- subset(results_down_age, FDR < 0.1)
+results_down_age$logpval <- -log10(results_down_age$PValue)
+
+results_age$deexpressed <- ifelse(results_age$FDR <= 0.1 & results_age$logFC >= 0, "UP", 
+                                  ifelse(results_age$FDR <= 0.1 & results_age$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_age, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+
+##Correlate age with gene expression within one parasitemia range (pf)
+pf_counts_all.txt <- read.delim("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/count_tables/pf_counts_all.txt.gz", comment.char="#")
+counts_pf_age <- pf_counts_all.txt[,c(7:240)]
+
+##Clean up colnames to be only sample ID
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub(".pf.subset.rmdup.bam*", "", colnames(counts_pf_age)[col])
+}
+
+for ( col in 1:ncol(counts_pf_age)){
+  colnames(counts_pf_age)[col] <-  sub("*X", "", colnames(counts_pf_age)[col])
+}
+
+##Subset by project
+infections <- read.delim("subsequent_infections_edit.txt", header = T)
+infection_list_age <- as.list(infections$id)
+
+counts_pf_age <- counts_pf_age[,colnames(counts_pf_age) %in% infection_list_age]
+counts_pf_age[] <- sapply(counts_pf_age, as.numeric)
+rownames(counts_pf_age) <- pf_counts_all.txt$Geneid
+
+all_age <- read.csv("mali_samples_allvariables.csv")
+all_age <- all_age[all_age$id %in% colnames(counts_pf_age),]
+all_age$age <- (all_age$year.x + 2000) - all_age$yearob
+all_age$parasitemia <- log(all_age$parasitemiepf)
+all_age <- subset(all_age, parasitemia >= 12 & parasitemia <= 13)
+counts_pf_age <- counts_pf_age[,colnames(counts_pf_age) %in% all_age$id]
+all_age <- all_age[ order(match(all_age$id, colnames(counts_pf_age))), ]
+
+##Create DGList
+dgList_pf_age <- DGEList(counts=counts_pf_age, genes=pf_counts_all.txt[c(1)])
+
+##Filter out lowly expressed genes
+keep <- rowSums(cpm(dgList_pf_age)>10) >= (ncol(dgList_pf_age$counts)/2)
+table(keep)
+dgListfilter_pf_age <- dgList_pf_age[keep, , keep.lib.sizes=FALSE]
+summary(cpm(dgListfilter_pf_age))
+dim(dgListfilter_pf_age)
+
+##Normalize
+dgListfilter_pf_age <- calcNormFactors(dgListfilter_pf_age, method="TMM")
+
+month <- factor(all_age$month.x)
+dgListfilter_pf_age$samples$group <- all_age$age
+
+sex <- factor(all_age$gender)
+month <- factor(all_age$month.x)
+
+##Unadjusted model for immune cell composition
+design_pf_age <- model.matrix(~dgListfilter_pf_age$samples$group + sex + month)
+rownames(design_pf_age) <- colnames(dgListfilter_pf_age)
+design_pf_age
+
+stages <- read.csv("pf_symptomatic_deconv.csv")
+names(stages)[names(stages) == 'Mixture'] <- 'id'
+stages <- stages[stages$id %in% all_age$id,]
+stages <- stages[ order(match(stages$id, all_age$id)), ]
+ring <- stages$ring
+troph <- stages$troph
+schiz <- stages$schiz
+M <- stages$M
+
+design_pf_age_adj <- model.matrix(~dgListfilter_pf_age$samples$group + sex + month + ring + troph + schiz + M)
+rownames(design_pf_age_adj) <- colnames(dgListfilter_pf_age)
+design_pf_age_adj
+
+##Estimate dispersion
+y_pf_age <- estimateDisp(dgListfilter_pf_age)
+
+fit_pf_age <- glmFit(y_pf_age, design_pf_age)
+lrt_pf_age <- glmLRT(fit_pf_age, coef = 2)
+topTags(lrt_pf_age)
+summary(decideTests(lrt_pf_age))
+
+results_pf_age <- as.data.frame(lrt_pf_age$table)
+results_pf_age$FDR <- p.adjust(results_pf_age$PValue, method="fdr")
+
+results_up_pf_age <- subset(results_pf_age, logFC > 0)
+results_up_pf_age <- subset(results_up_pf_age, FDR < 0.1)
+results_up_pf_age$logpval <- -log10(results_up_pf_age$PValue)
+
+results_down_pf_age <- subset(results_pf_age, logFC < 0)
+results_down_pf_age <- subset(results_down_pf_age, FDR < 0.1)
+results_down_pf_age$logpval <- -log10(results_down_pf_age$PValue)
+
+results_pf_age$deexpressed <- ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC >= 0, "UP",
+                                     ifelse(results_pf_age$FDR <= 0.1 & results_pf_age$logFC < 0, "DOWN", "NO"))
+
+mycolors <- c("blue", "red", "black")
+names(mycolors) <- c("DOWN", "UP", "NO")
+
+ggplot(results_pf_age, aes(x = logFC, y = -log10(PValue), col = deexpressed)) + 
+  geom_point() + scale_colour_manual(values = mycolors) + theme_classic() + theme(text = element_text(size = 30), legend.position = "none")
+
+allgenes <- read.delim("parasitemia_allages_pf.txt", sep = "\t")
+oneage <- read.delim("parasitemia_oneage_pf.txt", sep = "\t")
+
+interesting_genes <- as.data.frame(setdiff(rownames(oneage), rownames(allgenes)))
+
+```
+
+Section 11: Estimation of Fws with MOIMix
+```{r}
+library(moimix)
+seqVCF2GDS("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/pf_rmdup_bams/gatk_files/symptomatic_complete_filt_noindel.vcf.recode.vcf", "/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/pf_rmdup_bams/gatk_files/symptomatic.gds")
+
+isolates <- seqOpen("/Volumes/projects-t3/SerreDLab-3/kieran.tebben/mali/hisat2_outputs/pf_rmdup_bams/gatk_files/symptomatic.gds")
+seqSummary(isolates)
+
+sample.id <- seqGetData(isolates, "sample.id")
+
+coords <- getCoordinates(isolates)
+head(coords)
+table(coords$chromosome)
+
+qd <- seqGetData(isolates, "annotation/info/QD")
+sor <- seqGetData(isolates, "annotation/info/SOR") 
+hist(qd)
+hist(sor)
+
+##Estimating MOI with Fws
+fws_all <- getFws(isolates)
+fws_all
+
+df <- as_tibble(as.list(fws_all))
+df <- as.data.frame(t(df))
+```
+
+
