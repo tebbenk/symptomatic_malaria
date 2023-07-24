@@ -1,2 +1,3 @@
 align_samples_hisat2_human.pl: map each fastq file with samtools with maximum intron length set to human parameters.
+align_samples_hisat2_pf.pl: map each fastq file with samtools with maximum intron length set to Plasmodium parameters.
 clinical_parameters.Rmd: Code used for statistical analyses and to generate all figures presented in the paper.
