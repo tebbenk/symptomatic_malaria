@@ -1,6 +1,6 @@
 addRG_splitntrim_symptomatic.pl: pre-processing of BAM files for use with GATK4 haplotypeCaller
-align_samples_hisat2_human.pl: map each fastq file with samtools with maximum intron length set to human parameters.
-align_samples_hisat2_pf.pl: map each fastq file with samtools with maximum intron length set to Plasmodium parameters.
+align_samples_hisat2_human.pl: map each fastq file with hisat2 with maximum intron length set to human parameters.
+align_samples_hisat2_pf.pl: map each fastq file with hisat2 with maximum intron length set to Plasmodium parameters.
 clinical_parameters.Rmd: Code used for statistical analyses and to generate all figures presented in the paper.
 rmdup_geneal.pl: Custom script to remove PCR duplicate reads from BAM files. 
 subset_bam_human.pl: Subset BAM files to contain only reads mapping to the human genome. 
