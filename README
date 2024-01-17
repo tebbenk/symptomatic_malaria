@@ -6,3 +6,5 @@ rmdup_geneal.pl: Custom script to remove PCR duplicate reads from BAM files.
 subset_bam_human.pl: Subset BAM files to contain only reads mapping to the human genome. 
 subset_bam_plasmodiumreads.pl: Subset BAM files to contain only reads mapping to the P. falciparum genome. 
 subset_vcf.pl: Remove P. falciparum multi-gene families from GATK-generated VCF file. 
+
+Supplemental Tables 1 - 7: Supplemental tables from "Gene expression analyses reveal differences in host response to malaria according to the child's age" - Tebben et al
