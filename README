@@ -8,3 +8,15 @@ subset_bam_plasmodiumreads.pl: Subset BAM files to contain only reads mapping to
 subset_vcf.pl: Remove P. falciparum multi-gene families from GATK-generated VCF file. 
 
 Supplemental Tables 1 - 7: Supplemental tables from "Gene expression analyses reveal differences in host response to malaria according to the child's age" - Tebben et al
+Sequences presented in the manuscript are available at: BioProject PRJNA962942 [https://www.ncbi.nlm.nih.gov/bioproject/?term=PRJNA962942]
+
+To map and process RNA-seq reads for use with featureCounts, run the following programs in this order: 
+1) align_samples_hisat2_human.pl (for human) or align_samples_hisat2_pf.pl (for P. falciparum)
+2) subset_bam_human.pl (for human) or subset_bam_plasmodiumreads.pl (for P. falciparum)
+3) rmdup_geneal.pl
+
+To process RNA-seq reads for use with GATK, run the following programs in this order: 
+1) addRG_splitntrim_symptomatic.pl
+2) RUN GATK HAPLOTYPE CALLER ACCORDING TO MANUSCRIPT
+3) subset_vcf.pl
+
