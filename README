@@ -7,7 +7,7 @@ subset_bam_human.pl: Subset BAM files to contain only reads mapping to the human
 subset_bam_plasmodiumreads.pl: Subset BAM files to contain only reads mapping to the P. falciparum genome. 
 subset_vcf.pl: Remove P. falciparum multi-gene families from GATK-generated VCF file. 
 
-Supplemental Tables 1 - 7: Supplemental tables from "Gene expression analyses reveal differences in host response to malaria according to the child's age" - Tebben et al
+Supplemental Tables 1 - 6: Supplemental tables from "Gene expression analyses reveal differences in host response to malaria according to the child's age" - Tebben et al
 Sequences presented in the manuscript are available at: BioProject PRJNA962942 [https://www.ncbi.nlm.nih.gov/bioproject/?term=PRJNA962942]
 
 To map and process RNA-seq reads for use with featureCounts, run the following programs in this order: 
